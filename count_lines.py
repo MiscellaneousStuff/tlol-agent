@@ -1,6 +1,6 @@
 import time
 
-filename = "batch_124.jsonl"
+filename = "batch_001.jsonl"
 
 def buf_count_newlines(fname):
     lines = 0
