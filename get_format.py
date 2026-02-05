@@ -7,76 +7,112 @@ except ImportError:
 import json
 from collections import defaultdict
 
-# --- CONFIG ---
 FILE_PATH = "D:/huggingface/maknee/12_22/batch_001.jsonl.gz"
-MAX_EVENTS_TO_SCAN = None  # Scan all events for accurate count
 
 def stream_first_match(file_path):
     with gzip.open(file_path, 'rt', encoding='utf-8') as f:
         return f.readline()
 
-def explore_structure(file_path):
-    print(f"📂 Opening: {file_path}")
-    print(f"📦 Compressed size: {os.path.getsize(file_path) / (1024*1024):.1f} MB\n")
+def explore_replication(file_path):
+    print(f"📂 Opening: {file_path}\n")
     
-    print("⏳ Reading first match...")
     line = stream_first_match(file_path)
-    print(f"📏 First match JSON size: {len(line) / (1024*1024):.1f} MB\n")
-    
-    print("⏳ Parsing JSON...")
     match = json.loads(line)
     events = match.get("events", [])
-    print(f"📊 Total events in match: {len(events):,}\n")
     
-    # Count all packet types
-    packet_counts = defaultdict(int)
-    for event in events:
-        for packet_type in event.keys():
-            packet_counts[packet_type] += 1
+    replication_events = [e["Replication"] for e in events if "Replication" in e]
+    print(f"📊 Found {len(replication_events):,} Replication events")
     
-    print("=" * 60)
-    print("PACKET TYPE COUNTS")
-    print("=" * 60)
-    for ptype, count in sorted(packet_counts.items(), key=lambda x: -x[1]):
-        print(f"  {ptype:<30} {count:>8,}")
+    # Get time range
+    times = [r.get("time", 0) for r in replication_events]
+    min_t, max_t = min(times), max(times)
+    print(f"⏱️  Time range: {min_t:.1f}s - {max_t:.1f}s ({max_t/60:.1f} mins)\n")
     
-    # --- HERO DIE ANALYSIS ---
-    print("\n" + "=" * 60)
-    print("💀 HERO DIE ANALYSIS")
-    print("=" * 60)
+    # --- SAMPLE FROM DIFFERENT GAME PHASES ---
+    print("=" * 70)
+    print("REPLICATION SAMPLES BY GAME PHASE")
+    print("=" * 70)
     
-    hero_die_events = [e["HeroDie"] for e in events if "HeroDie" in e]
-    print(f"\nFound {len(hero_die_events)} HeroDie events (JSON parsed)")
+    phases = [
+        ("Early (0-5 min)", 0, 300),
+        ("Mid (10-15 min)", 600, 900),
+        ("Late (20-25 min)", 1200, 1500),
+        ("Very Late (30+ min)", 1800, 9999),
+    ]
     
-    # Compare with byte counting
-    byte_count = line.encode('utf-8').count(b'"HeroDie"')
-    print(f"Byte pattern count for '\"HeroDie\"': {byte_count}")
-    
-    if hero_die_events:
-        print("\nSample HeroDie events:")
-        for i, death in enumerate(hero_die_events[:5]):
-            print(f"\n  Death {i+1}: {json.dumps(death, indent=4)}")
+    for phase_name, t_start, t_end in phases:
+        phase_events = [r for r in replication_events if t_start <= r.get("time", 0) < t_end]
+        if not phase_events:
+            print(f"\n🔹 {phase_name}: No events")
+            continue
         
-        # Check for different death-related fields
-        print("\n\nHeroDie field analysis:")
-        all_keys = set()
-        for death in hero_die_events:
-            all_keys.update(death.keys())
-        print(f"  All fields in HeroDie: {sorted(all_keys)}")
+        print(f"\n🔹 {phase_name}: {len(phase_events)} events")
+        
+        # Show one sample
+        sample = phase_events[len(phase_events)//2]  # Middle of phase
+        print(f"   Sample at t={sample.get('time', 0):.1f}s:")
+        print(json.dumps(sample, indent=2)[:1500])
+        if len(json.dumps(sample)) > 1500:
+            print("   ... (truncated)")
     
-    # --- CHECK FOR OTHER DEATH-RELATED PACKETS ---
-    print("\n" + "=" * 60)
-    print("🔍 OTHER DEATH-RELATED PACKETS")
-    print("=" * 60)
+    # --- FIELD ANALYSIS FROM LATE GAME ---
+    print("\n" + "=" * 70)
+    print("LATE GAME FIELD ANALYSIS (20+ mins)")
+    print("=" * 70)
     
-    death_related = ['NPCDieMapView', 'NPCDieMapViewBroadcast', 'Die', 'Death']
-    for ptype in death_related:
-        matching = [e[ptype] for e in events if ptype in e]
-        if matching:
-            print(f"\n{ptype}: {len(matching)} events")
-            print(f"  Sample: {json.dumps(matching[0], indent=4)[:400]}")
+    late_events = [r for r in replication_events if r.get("time", 0) >= 1200]
+    if not late_events:
+        late_events = replication_events[-1000:]  # Fallback to last 1000
+        print("(Using last 1000 events as fallback)")
+    
+    field_names = defaultdict(int)
+    field_samples = {}
+    
+    for rep in late_events[:500]:
+        for key, value in rep.items():
+            if key == "time":
+                continue
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict) and "name" in item:
+                        fname = item["name"]
+                        field_names[fname] += 1
+                        if fname not in field_samples:
+                            field_samples[fname] = item
+    
+    print(f"\n{'Field Name':<30} {'Count':>10}")
+    print("-" * 42)
+    for fname, count in sorted(field_names.items(), key=lambda x: -x[1]):
+        print(f"{fname:<30} {count:>10,}")
+    
+    # --- TRACK HERO ENTITY LATE GAME ---
+    print("\n" + "=" * 70)
+    print("TRACKING HERO HEALTH OVER LATE GAME")
+    print("=" * 70)
+    
+    # Find entity with health data
+    hero_entities = set()
+    for rep in late_events[:100]:
+        for key, value in rep.items():
+            if key == "time":
+                continue
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict) and item.get("name") == "health":
+                        hero_entities.add(key)
+    
+    if hero_entities:
+        sample_hero = list(hero_entities)[0]
+        print(f"\nTracking entity: {sample_hero}")
+        
+        for rep in late_events[::50][:10]:  # Every 50th event, 10 samples
+            if sample_hero in rep:
+                t = rep.get("time", 0)
+                data = rep[sample_hero]
+                health = next((d for d in data if isinstance(d, dict) and d.get("name") == "health"), None)
+                print(f"  t={t:>7.1f}s: {health}")
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         FILE_PATH = sys.argv[1]
-    explore_structure(FILE_PATH)
+    explore_replication(FILE_PATH)
