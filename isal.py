@@ -2,7 +2,6 @@ import glob
 import os
 import csv
 import multiprocessing
-import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # --- COMPRESSION LIBRARY SELECTOR ---
@@ -12,10 +11,8 @@ try:
 except ImportError:
     try:
         from indexed_gzip import IndexedGzipFile
-        import gzip as std_gzip
         print("🚀 Using: Indexed_Gzip (Fast)")
         
-        # Wrapper to make indexed_gzip look like standard gzip for our usage
         class FastGzip:
             def open(self, filename, mode='rb'):
                 return IndexedGzipFile(filename)
@@ -33,9 +30,60 @@ except ImportError:
 # --- CONFIG ---
 MAX_WORKERS = max(4, multiprocessing.cpu_count() - 2)
 
-def process_file_optimized(file_path):
+# Byte patterns
+P_DEATH = b'"HeroDie"'
+P_SPELL = b'"CastSpellAns"'
+P_ATTACK = b'"BasicAttackPos"'
+P_DAMAGE = b'"UnitApplyDamage"'
+P_ITEM = b'"BuyItem"'
+P_CHAMP_PRE = b'"champion":"'
+
+def new_game_stats():
+    return {
+        'deaths': 0, 'spells': 0, 'attacks': 0,
+        'damage': 0, 'items': 0, 'champs': set(), 'size_bytes': 0
+    }
+
+def process_game_chunk(chunk, stats):
+    """Process a chunk of data for one game, updating stats in place."""
+    stats['size_bytes'] += len(chunk)
+    stats['deaths'] += chunk.count(P_DEATH)
+    stats['spells'] += chunk.count(P_SPELL)
+    stats['attacks'] += chunk.count(P_ATTACK)
+    stats['damage'] += chunk.count(P_DAMAGE)
+    stats['items'] += chunk.count(P_ITEM)
+    
+    if P_CHAMP_PRE in chunk:
+        parts = chunk.split(P_CHAMP_PRE)
+        for p in parts[1:]:
+            end = p.find(b'"')
+            if 0 < end < 30:
+                try:
+                    stats['champs'].add(p[:end].decode('utf-8'))
+                except:
+                    pass
+
+def finalize_stats(stats, filename, patch, game_idx):
+    """Convert stats to output row."""
+    champs_str = "|".join(sorted(stats['champs']))
+    return {
+        'file': filename,
+        'game_idx': game_idx,
+        'patch': patch,
+        'size_mb': round(stats['size_bytes'] / (1024 * 1024), 2),
+        'deaths': stats['deaths'],
+        'spells': stats['spells'],
+        'attacks': stats['attacks'],
+        'damage': stats['damage'],
+        'items': stats['items'],
+        'n_champs': len(stats['champs']),
+        'champs': champs_str
+    }
+
+def process_file_per_game(file_path):
     filename = os.path.basename(file_path)
     
+    # Extract patch from path
     patch = "unknown"
     parts = file_path.replace("\\", "/").split("/")
     for p in parts:
@@ -43,24 +91,12 @@ def process_file_optimized(file_path):
             patch = p
             break
 
-    stats = {
-        'file': filename, 'patch': patch, 'games_est': 0,
-        'deaths': 0, 'spells': 0, 'attacks': 0, 
-        'damage': 0, 'items': 0, 'champs': set(),
-        'size_mb': 0
-    }
-
-    # Byte patterns
-    P_GAME_START = b'{"events":'
-    P_DEATH = b'"HeroDie"'
-    P_SPELL = b'"CastSpellAns"'
-    P_ATTACK = b'"BasicAttackPos"'
-    P_DAMAGE = b'"UnitApplyDamage"'
-    P_ITEM = b'"BuyItem"'
-    P_CHAMP_PRE = b'"champion":"'
+    results = []
+    game_idx = 0
+    current_stats = new_game_stats()
+    buffer = b""
     
-    CHUNK_SIZE = 4 * 1024 * 1024 
-    total_bytes = 0
+    CHUNK_SIZE = 8 * 1024 * 1024  # 8MB chunks
 
     try:
         with gzip.open(file_path, 'rb') as f:
@@ -69,32 +105,37 @@ def process_file_optimized(file_path):
                 if not chunk:
                     break
                 
-                total_bytes += len(chunk)
+                # Prepend leftover buffer
+                data = buffer + chunk
                 
-                stats['games_est'] += chunk.count(P_GAME_START)
-                stats['deaths'] += chunk.count(P_DEATH)
-                stats['spells'] += chunk.count(P_SPELL)
-                stats['attacks'] += chunk.count(P_ATTACK)
-                stats['damage'] += chunk.count(P_DAMAGE)
-                stats['items'] += chunk.count(P_ITEM)
+                # Split by newlines (JSONL = one JSON per line)
+                lines = data.split(b'\n')
                 
-                if P_CHAMP_PRE in chunk:
-                    parts = chunk.split(P_CHAMP_PRE)
-                    for p in parts[1:]:
-                        end = p.find(b'"')
-                        if end != -1 and end < 30:
-                            try:
-                                stats['champs'].add(p[:end].decode('utf-8'))
-                            except: pass
+                # Last element might be incomplete - save for next iteration
+                buffer = lines[-1]
+                complete_lines = lines[:-1]
+                
+                for line in complete_lines:
+                    if not line.strip():
+                        continue
+                    
+                    # Process this complete game line
+                    process_game_chunk(line, current_stats)
+                    
+                    # Finalize and save
+                    results.append(finalize_stats(current_stats, filename, patch, game_idx))
+                    game_idx += 1
+                    current_stats = new_game_stats()
+            
+            # Handle final buffer (last game if no trailing newline)
+            if buffer.strip():
+                process_game_chunk(buffer, current_stats)
+                results.append(finalize_stats(current_stats, filename, patch, game_idx))
 
     except Exception as e:
         return None, f"Error {filename}: {e}"
     
-    stats['size_mb'] = round(total_bytes / (1024*1024), 1)
-    stats['champs'] = "|".join(sorted(list(stats['champs'])))
-    stats['n_champs'] = len(stats['champs'].split("|")) if stats['champs'] else 0
-    
-    return [stats], None
+    return results, None
 
 def main():
     pattern = "D:/huggingface/maknee/12_22/*.jsonl.gz"
@@ -104,25 +145,31 @@ def main():
     all_rows = []
     
     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(process_file_optimized, f): f for f in files}
+        futures = {executor.submit(process_file_per_game, f): f for f in files}
         
         if HAS_TQDM:
-            pbar = tqdm(total=len(files), unit="file")
+            pbar = tqdm(total=len(files), unit="file", desc="Processing")
         
         for future in as_completed(futures):
             data, err = future.result()
-            if data: all_rows.extend(data)
-            elif err: print(f"\n{err}")
+            if data:
+                all_rows.extend(data)
+            elif err:
+                print(f"\n{err}")
             
-            if HAS_TQDM: pbar.update(1)
+            if HAS_TQDM:
+                pbar.update(1)
+        
+        if HAS_TQDM:
+            pbar.close()
 
     if all_rows:
-        keys = ['file', 'patch', 'size_mb', 'games_est', 'deaths', 'spells', 'attacks', 'damage', 'items', 'n_champs', 'champs']
-        with open("metadata_optimized.csv", "w", newline="", encoding="utf-8") as f:
+        keys = ['file', 'game_idx', 'patch', 'size_mb', 'deaths', 'spells', 'attacks', 'damage', 'items', 'n_champs', 'champs']
+        with open("metadata_per_game.csv", "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=keys)
             writer.writeheader()
             writer.writerows(all_rows)
-        print("\nSaved to metadata_optimized.csv")
+        print(f"\n✅ Saved {len(all_rows)} games to metadata_per_game.csv")
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
