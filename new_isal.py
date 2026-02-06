@@ -275,9 +275,9 @@ def process_file_per_game(file_path):
     return results, None
 
 def main():
-    pattern = "D:/huggingface/maknee/*/*.jsonl.gz"
+    pattern = "D:/huggingface/maknee/12_22/*.jsonl.gz"
     files = sorted(glob.glob(pattern))
-    files = [files[0]]
+    # files = [files[0]]
     print(f"Found {len(files)} files.")
     
     all_rows = []
